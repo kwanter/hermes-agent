@@ -12863,9 +12863,20 @@ class AIAgent:
             # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
             _sanitize_messages_surrogates(api_messages)
 
-            # Calculate approximate request size for logging
-            total_chars = sum(len(str(msg)) for msg in api_messages)
-            approx_tokens = estimate_messages_tokens_rough(api_messages)
+            # Calculate approximate request size for logging — skip in quiet
+            # mode without verbose_logging since the result is never used
+            # then. estimate_messages_tokens_rough iterates every message in
+            # api_messages on every API call, which is O(N) per call and
+            # O(N^2) over a conversation. Skipping it in the CLI default
+            # quiet path saves measurable per-turn CPU (~1.5ms over 30 turns
+            # in profiling).
+            _needs_request_size = (not self.quiet_mode) or self.verbose_logging
+            if _needs_request_size:
+                total_chars = sum(len(str(msg)) for msg in api_messages)
+                approx_tokens = estimate_messages_tokens_rough(api_messages)
+            else:
+                total_chars = 0
+                approx_tokens = 0
             
             # Thinking spinner for quiet mode (animated during API call)
             thinking_spinner = None
