@@ -1691,6 +1691,13 @@ async def get_action_status(name: str, lines: int = 200):
         exit_code = proc.poll()
         running = exit_code is None
         pid = proc.pid
+        if not running:
+            # Reap the finished child to prevent zombie accumulation.
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+            _ACTION_PROCS.pop(name, None)
 
     return {
         "name": name,

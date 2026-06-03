@@ -823,6 +823,40 @@ class TestWebServerEndpoints:
         assert resp.json() == {"ok": True, "pid": 12345, "name": "hermes-update"}
         assert calls == [(["update"], "hermes-update")]
 
+    def test_finished_action_proc_is_reaped_and_removed(self):
+        """Processes that have exited are reaped via .wait() and removed
+        from _ACTION_PROCS so they do not accumulate as zombies."""
+        import hermes_cli.web_server as web_server
+
+        waited = []
+
+        class FinishedProc:
+            pid = 99999
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                waited.append(timeout)
+                return 0
+
+        name = "gateway-restart"
+        proc = FinishedProc()
+        web_server._ACTION_PROCS[name] = proc
+        web_server._ACTION_RESULTS.pop(name, None)
+        try:
+            status = self.client.get(f"/api/actions/{name}/status")
+            assert status.status_code == 200
+            data = status.json()
+            assert data["running"] is False
+            assert data["exit_code"] == 0
+            assert data["pid"] == 99999
+            # The proc should have been reaped and removed.
+            assert waited, "proc.wait() was not called"
+            assert name not in web_server._ACTION_PROCS
+        finally:
+            web_server._ACTION_PROCS.pop(name, None)
+
     def test_get_status_filters_unconfigured_gateway_platforms(self, monkeypatch):
         import gateway.config as gateway_config
         import hermes_cli.web_server as web_server
