@@ -6921,13 +6921,6 @@ class GatewayRunner:
                 return None
             return SmsAdapter(config)
 
-        elif platform == Platform.FEISHU:
-            from gateway.platforms.feishu import FeishuAdapter, check_feishu_requirements
-            if not check_feishu_requirements():
-                logger.warning("Feishu: lark-oapi not installed or FEISHU_APP_ID/SECRET not set")
-                return None
-            return FeishuAdapter(config)
-
         elif platform == Platform.WECOM_CALLBACK:
             from gateway.platforms.wecom_callback import (
                 WecomCallbackAdapter,

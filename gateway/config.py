@@ -433,7 +433,6 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
         str(cfg.extra.get("client_state") or "").strip()
     ),
-    Platform.FEISHU: lambda cfg: bool(cfg.extra.get("app_id")),
     Platform.WECOM: lambda cfg: bool(cfg.extra.get("bot_id")),
     Platform.WECOM_CALLBACK: lambda cfg: bool(
         cfg.extra.get("corp_id") or cfg.extra.get("apps")
@@ -1113,11 +1112,9 @@ def load_gateway_config() -> GatewayConfig:
             # apply_yaml_config_fn hook (plugins/platforms/matrix/adapter.py).
             # #41112 / #3823.
 
-            # Feishu settings → env vars (env vars take precedence)
-            feishu_cfg = yaml_cfg.get("feishu", {})
-            if isinstance(feishu_cfg, dict):
-                if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
-                    os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+            # Feishu settings → env vars: migrated to the feishu plugin's
+            # apply_yaml_config_fn hook (plugins/platforms/feishu/adapter.py).
+            # #41112 / #3823.
 
     except Exception as e:
         logger.warning(

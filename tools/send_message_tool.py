@@ -598,12 +598,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     except ImportError:
         _telegram_available = False
 
-    # Feishu adapter import is optional (requires lark-oapi)
-    try:
-        from gateway.platforms.feishu import FeishuAdapter
-        _feishu_available = True
-    except ImportError:
-        _feishu_available = False
+    # Feishu adapter migrated to a plugin (#41112); its max_message_length
+    # (8000) now flows through the registry fallback below.
 
     media_files = media_files or []
 
@@ -615,13 +611,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             logger.debug("Failed to apply Slack mrkdwn formatting in _send_to_platform", exc_info=True)
 
     # Platform message length limits (from adapter class attributes for
-    # built-in platforms; from PlatformEntry.max_message_length for plugins).
+    # built-in platforms; from PlatformEntry.max_message_length for plugins,
+    # resolved via the registry fallback below — covers Feishu since #41112).
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
     }
-    if _feishu_available:
-        _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
 
     # Check plugin registry for max_message_length
     if platform not in _MAX_LENGTHS:
@@ -742,12 +737,19 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
-    # --- Feishu: native media attachment support via adapter ---
+    # --- Feishu: native media attachment support via the registry's
+    # standalone_sender_fn (plugins/platforms/feishu/adapter.py::_standalone_send). #41112
     if platform == Platform.FEISHU and media_files:
+        from gateway.platform_registry import platform_registry as _pr_feishu
+        from hermes_cli.plugins import discover_plugins as _dp_feishu
+        _dp_feishu()
+        _feishu_entry = _pr_feishu.get("feishu")
+        if _feishu_entry is None or _feishu_entry.standalone_sender_fn is None:
+            return {"error": "Feishu plugin not registered or missing standalone_sender_fn"}
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _send_feishu(
+            result = await _feishu_entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
@@ -791,7 +793,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.DINGTALK:
             result = await _registry_standalone_send("dingtalk", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.FEISHU:
-            result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
+            result = await _registry_standalone_send("feishu", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
         elif platform == Platform.BLUEBUBBLES:
@@ -1516,61 +1518,9 @@ async def _send_bluebubbles(extra, chat_id, message):
         return _error(f"BlueBubbles send failed: {e}")
 
 
-async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None):
-    """Send via Feishu/Lark using the adapter's send pipeline."""
-    try:
-        from gateway.platforms.feishu import FeishuAdapter, FEISHU_AVAILABLE
-        if not FEISHU_AVAILABLE:
-            return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
-        from gateway.platforms.feishu import FEISHU_DOMAIN, LARK_DOMAIN
-    except ImportError:
-        return {"error": "Feishu dependencies not installed. Run: pip install 'hermes-agent[feishu]'"}
-
-    media_files = media_files or []
-
-    try:
-        adapter = FeishuAdapter(pconfig)
-        domain_name = getattr(adapter, "_domain_name", "feishu")
-        domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
-        adapter._client = adapter._build_lark_client(domain)
-        metadata = {"thread_id": thread_id} if thread_id else None
-
-        last_result = None
-        if message.strip():
-            last_result = await adapter.send(chat_id, message, metadata=metadata)
-            if not last_result.success:
-                return _error(f"Feishu send failed: {last_result.error}")
-
-        for media_path, is_voice in media_files:
-            if not os.path.exists(media_path):
-                return _error(f"Media file not found: {media_path}")
-
-            ext = os.path.splitext(media_path)[1].lower()
-            if ext in _IMAGE_EXTS:
-                last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
-            elif ext in _VIDEO_EXTS:
-                last_result = await adapter.send_video(chat_id, media_path, metadata=metadata)
-            elif ext in _VOICE_EXTS and is_voice:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
-            elif ext in _AUDIO_EXTS:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
-            else:
-                last_result = await adapter.send_document(chat_id, media_path, metadata=metadata)
-
-            if not last_result.success:
-                return _error(f"Feishu media send failed: {last_result.error}")
-
-        if last_result is None:
-            return {"error": "No deliverable text or media remained after processing MEDIA tags"}
-
-        return {
-            "success": True,
-            "platform": "feishu",
-            "chat_id": chat_id,
-            "message_id": last_result.message_id,
-        }
-    except Exception as e:
-        return _error(f"Feishu send failed: {e}")
+# _send_feishu moved to plugins/platforms/feishu/adapter.py::_standalone_send,
+# wired via standalone_sender_fn and reached through _registry_standalone_send
+# (and the feishu media branch above). #41112.
 
 
 def _check_send_message():
