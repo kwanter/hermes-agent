@@ -13,7 +13,12 @@ import { createCliRenderer, type CliRenderer, type KeyEvent, type Selection } fr
 import { Deferred, Effect } from 'effect'
 
 import { RendererError } from './errors.ts'
+import { installFfiCoordSafety } from './ffiSafe.ts'
 import { getLog } from './log.ts'
+
+// Node-FFI seam: clamp negative draw coordinates BEFORE the u32 FFI marshaling
+// (see ffiSafe.ts — scrolled-out <diff> line backgrounds crashed the render loop).
+installFfiCoordSafety()
 
 /**
  * The text a finished selection copies: the RENDERED text the user highlighted,

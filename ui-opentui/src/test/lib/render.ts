@@ -23,6 +23,13 @@ import { testRender, useRenderer } from '@opentui/solid'
 import type { JSX } from '@opentui/solid'
 import { createMemo } from 'solid-js'
 
+import { installFfiCoordSafety } from '../../boundary/ffiSafe.ts'
+
+// Headless renders go through the same node:ffi seam as the live TUI — install
+// the negative-coordinate shim here too (the live path installs it in
+// boundary/renderer.ts, which tests don't import).
+installFfiCoordSafety()
+
 /** Wrap a node in a KeymapProvider whose keymap is bound to the test renderer. */
 function withKeymap(node: () => JSX.Element): () => JSX.Element {
   return () => {
