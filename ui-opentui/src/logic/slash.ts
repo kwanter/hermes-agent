@@ -152,7 +152,11 @@ function present(ctx: SlashContext, title: string, text: string): void {
 
 /** Process-diagnostic commands — hidden behind `HERMES_TUI_DIAGNOSTICS`
  *  (logic/env.ts). Regular users never see them; support flows enable them
- *  with one env var. Keep this set in sync with the `(diag)` lines below. */
+ *  with one env var. Keep this set in sync with the `(diag)` lines below.
+ *  DESIGN ASSUMPTION (review 2026-06-12): these stay CLIENT-ONLY. Completion
+ *  is gateway-driven and hides them only because the gateway doesn't know
+ *  them — adding a server command with one of these names requires gating it
+ *  gateway-side too (the early return below would shadow, not hide, it). */
 const DIAGNOSTIC_COMMANDS = new Set(['mem', 'heapdump'])
 
 const CLIENT_HELP_LINES = [

@@ -9,14 +9,14 @@ classified by who should ever touch it. The design rule shipped with this doc:
 
 | var | default | effect |
 |---|---|---|
-| `HERMES_TUI_DIAGNOSTICS` | **off** | Enables the diagnostic slash commands (`/mem`, `/heapdump`) — hidden from `/help` and completion otherwise, and invoking them while off prints the enable hint rather than executing. Also flips the *default* of `HERMES_TUI_WINDOW_STATS` to on. Not a secret — support flows are "relaunch with `HERMES_TUI_DIAGNOSTICS=1`". |
+| `HERMES_TUI_DIAGNOSTICS` | **off** | Enables the diagnostic slash commands (`/mem`, `/heapdump`). While off they're hidden from `/help` (client-side filter) and invoking them prints the enable hint rather than executing. They never appear in slash *completion* in either state — completion is gateway-driven and these are client-only commands the gateway doesn't know (an adversarial review confirmed there's no bypass path; if a SERVER command named `mem`/`heapdump` is ever added it must be gated gateway-side too — the client gate would shadow but not hide it). Also flips the *default* of `HERMES_TUI_WINDOW_STATS` to on. Not a secret — support flows are "relaunch with `HERMES_TUI_DIAGNOSTICS=1`". |
 
 ## 2. User-facing configuration (fine to document publicly)
 
 | var | default | effect |
 |---|---|---|
 | `HERMES_TUI_ENGINE` | auto (`opentui` if Node≥26.3 + built, else `ink`) | Engine pick; also `display.tui_engine` in config.yaml. |
-| `HERMES_TUI_MOUSE` | on (launcher sets it) | Mouse support (wheel scroll, selection, click-to-expand). |
+| `HERMES_TUI_MOUSE` | on (launcher sets it) | Mouse support (wheel scroll, selection, click-to-expand). **Glitch verdict 2026-06-12: leave as-is — always on, no realistic reason to disable; treat as plumbing, don't document it user-facing.** |
 | `HERMES_TUI_MAX_MESSAGES` | ceiling | Scrollback rows kept in the TUI. Can LOWER the ceiling, never raise: 3000 with windowing, 1000 with windowing off (handle-table safety). |
 | `HERMES_TUI_TOOL_OUTPUT_LINES` | unlimited | Cap expanded tool-output lines (set a number to restore a cap). |
 | `HERMES_TUI_COMPOSER_ROWS` | default rows | Composer height. |
