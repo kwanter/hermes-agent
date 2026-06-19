@@ -4455,6 +4455,10 @@ async function buildRemoteConnection(rawUrl, authMode, token, source, remoteHost
 // resolveRemoteBackend calls within one app run.
 const sshConnections = new Map()
 
+// One-shot guard so the awaited before-quit SSH teardown (which preventDefaults
+// the first quit) doesn't loop when app.quit() fires the event again.
+let sshQuitTeardownDone = false
+
 function sshScopeKey(profile) {
   return connectionScopeKey(profile) || ''
 }
@@ -4515,15 +4519,35 @@ async function teardownSshConnection(profile) {
 // (it must never leak into token/oauth remotes, whose trust boundary is a
 // token/cookie, not a shell credential). Returns { ssh, scope } so the spawned
 // terminal can be tagged with its backing scope and disposed on a flip.
+//
+// CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
+// any cached SSH state. A per-profile token/OAuth override wins over a global
+// SSH connection — so if the active profile resolves to a NON-SSH backend, the
+// terminal must NOT fall through to a global SSH host. Returning cached SSH
+// state unconditionally would leak an ssh -tt shell into a token/OAuth remote.
 function activeSshTerminalTarget() {
-  const primaryScope = sshScopeKey(primaryProfileKey())
-  // Try the primary scope first, then the global scope (one of them backs the
-  // window depending on whether a per-profile SSH override is in play).
-  for (const scope of [primaryScope, '']) {
+  const profile = primaryProfileKey()
+  const config = readDesktopConnectionConfig()
+
+  // 1. Per-profile SSH override → that scope's SSH state (if live).
+  if (profileSshOverride(config, profile)) {
+    const scope = sshScopeKey(profile)
     const state = sshConnections.get(scope)
-    if (state && state.ssh) {
-      return { ssh: state.ssh, scope }
-    }
+    return state && state.ssh ? { ssh: state.ssh, scope } : null
+  }
+  // 2. Per-profile NON-SSH override (token/OAuth) → NOT an SSH terminal. Stop
+  //    here; do not fall through to global SSH.
+  if (profileRemoteOverride(config, profile)) {
+    return null
+  }
+  // 3. Env override is token-auth URL remote, never SSH.
+  if (process.env.HERMES_DESKTOP_REMOTE_URL) {
+    return null
+  }
+  // 4. Global SSH → the global scope's SSH state (if live).
+  if (config.mode === 'ssh') {
+    const state = sshConnections.get('')
+    return state && state.ssh ? { ssh: state.ssh, scope: '' } : null
   }
   return null
 }
@@ -4693,13 +4717,17 @@ function configuredRemoteProfileNames() {
 }
 
 // True when the app is in app-global remote mode (Settings → "All profiles" →
-// Remote, or the env override): a SINGLE remote backend serves every profile via
-// ?profile=. Distinct from per-profile overrides — here there's one host for all.
+// Remote/SSH, or the env override): a SINGLE remote backend serves every
+// profile via ?profile=. Distinct from per-profile overrides — here there's one
+// host for all. SSH counts: a global SSH connection resolves to one loopback
+// backend that, exactly like a global URL remote, must carry ?profile= so each
+// desktop profile maps to its own profile on the remote (not the remote default).
 function globalRemoteActive() {
   if (process.env.HERMES_DESKTOP_REMOTE_URL) {
     return true
   }
-  return readDesktopConnectionConfig().mode === 'remote'
+  const mode = readDesktopConnectionConfig().mode
+  return mode === 'remote' || mode === 'ssh'
 }
 
 // GET a profile's resolved backend (remote pool or local primary), parsed JSON.
@@ -6979,7 +7007,7 @@ function configureSpellChecker() {
   }
 }
 
-app.on('before-quit', () => {
+app.on('before-quit', event => {
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {
     try {
@@ -7007,11 +7035,24 @@ app.on('before-quit', () => {
   }
   stopAllPoolBackends()
 
-  // Close SSH control masters (best-effort, fire-and-forget). The REMOTE
-  // dashboards are intentionally LEFT running so a relaunch reconnects via the
-  // lockfile reuse flow without re-bootstrapping (VS Code semantics).
-  for (const scope of [...sshConnections.keys()]) {
-    void teardownSshConnection(scope || null)
+  // Close SSH control masters so local forwards don't linger after quit (the
+  // master is opened with -f/ControlPersist, so a fire-and-forget close can be
+  // cut off by app exit before the socket is torn down). The REMOTE dashboards
+  // are intentionally LEFT running — only the local-side master/forward closes —
+  // so a relaunch reconnects via the lockfile reuse flow without re-bootstrapping
+  // (VS Code semantics). One-shot: preventDefault the first quit, await teardown
+  // (bounded so a wedged ssh can't block quit), then quit again.
+  if (sshConnections.size > 0 && !sshQuitTeardownDone) {
+    event.preventDefault()
+    const scopes = [...sshConnections.keys()]
+    const bounded = Promise.race([
+      Promise.allSettled(scopes.map(scope => teardownSshConnection(scope || null))),
+      new Promise(resolve => setTimeout(resolve, 4000))
+    ])
+    void bounded.then(() => {
+      sshQuitTeardownDone = true
+      app.quit()
+    })
   }
 })
 
