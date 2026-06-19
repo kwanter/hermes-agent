@@ -106,6 +106,38 @@ def test_digest_old_messages_captures_tool_names():
     assert "tools: skill_view, patch" in digest
 
 
+def test_digest_foregrounds_signal_turns():
+    # A correction buried in filler must be surfaced under the SIGNALS header,
+    # not just truncated into the arc — this is the mechanism that lets the
+    # digest IMPROVE capture rather than merely preserve it.
+    old = [_msg("user", "filler question " + str(i)) for i in range(20)]
+    old.append(_msg("user", "stop being so verbose, just give me the answer from now on"))
+    old.append(_msg("assistant", "the fix was setting stdin=subprocess.DEVNULL on the bridge"))
+    digest = br._digest_old_messages(old)
+    assert "POTENTIAL LEARNING SIGNALS" in digest
+    assert "stop being so verbose" in digest
+    assert "stdin=subprocess.DEVNULL" in digest
+    # Arc still present for context.
+    assert "Conversation arc" in digest
+
+
+def test_digest_no_signals_omits_signal_header():
+    old = [_msg("user", "what's the capital of france"), _msg("assistant", "Paris.")]
+    digest = br._digest_old_messages(old)
+    assert "POTENTIAL LEARNING SIGNALS" not in digest
+    assert "Conversation arc" in digest
+
+
+def test_is_signal_turn_detects_corrections_and_facts():
+    assert br._is_signal_turn(_msg("user", "stop doing that, it's too verbose"))
+    assert br._is_signal_turn(_msg("user", "for context, I run a 3-node proxmox cluster"))
+    assert br._is_signal_turn(_msg("user", "from now on always use tabs"))
+    assert br._is_signal_turn(_msg("assistant", "the fix was a missing await"))
+    # Plain Q&A is not a signal.
+    assert not br._is_signal_turn(_msg("user", "what's the default postgres port"))
+    assert not br._is_signal_turn(_msg("assistant", "It's 5432."))
+
+
 # ---------------------------------------------------------------------------
 # ④  adaptive cadence
 # ---------------------------------------------------------------------------

@@ -169,28 +169,87 @@ def _rough_token_count(messages: List[Dict]) -> int:
     return int(total / 2.75)
 
 
-def _digest_old_messages(old: List[Dict]) -> str:
-    """Summarise dropped older turns as a compact text digest (no LLM call).
+def _msg_text(m: Dict) -> str:
+    """Extract plain text from a message's content (str or block list)."""
+    c = m.get("content")
+    if isinstance(c, str):
+        return c.strip()
+    if isinstance(c, list):
+        return " ".join(
+            b.get("text", "") for b in c if isinstance(b, dict)
+        ).strip()
+    return ""
 
-    Captures who-said-what and which tools ran so the review fork still sees
-    the arc of the conversation, just not verbatim. Deterministic and free —
-    the whole point is to avoid replaying (and paying for) the full history.
+
+# Lexical cues for turns that tend to carry a durable learning signal. Used to
+# FOREGROUND signal-bearing turns in the digest rather than truncating them into
+# noise. This is a salience heuristic, not a classifier — the review model still
+# makes the final save decision; we just make sure the candidate turns survive
+# the digest verbatim instead of being crushed to 250 chars alongside filler.
+_USER_SIGNAL_CUES = (
+    # corrections / frustration / style + workflow preferences
+    "stop ", "don't ", "do not ", "never ", "always ", "i hate", "too verbose",
+    "too long", "just give me", "why are you", "you keep", "you always",
+    "from now on", "remember", "prefer", "instead of", "not like", "no —",
+    "no -", "that's wrong", "thats wrong", "incorrect", "i told you",
+    "i've told you", "ive told you", "make that", "going forward",
+    # durable persona / environment facts
+    "for context", "my setup", "i run", "i use", "i work", "my stack",
+    "assume that", "tailor", "i'm on", "im on", "we use", "our ",
+)
+_ASSISTANT_SIGNAL_CUES = (
+    "the fix", "fixed it", "root cause", "the trick", "the issue was",
+    "turned out", "the reusable", "recipe", "the approach", "workaround",
+    "so the fix", "that fixed", "the cause", "the bug was",
+)
+
+
+def _is_signal_turn(m: Dict) -> bool:
+    role = m.get("role")
+    text = _msg_text(m).lower()
+    if not text:
+        return False
+    if role == "user":
+        return any(cue in text for cue in _USER_SIGNAL_CUES)
+    if role == "assistant":
+        return any(cue in text for cue in _ASSISTANT_SIGNAL_CUES)
+    return False
+
+
+def _digest_old_messages(old: List[Dict]) -> str:
+    """Summarise dropped older turns as a compact, SIGNAL-AWARE text digest.
+
+    A naive digest that uniformly truncates every old turn to ~250 chars buries
+    a one-line correction ("stop being verbose") under hundreds of filler lines —
+    the review model's attention is then diluted across the haystack exactly as
+    it is on the full transcript, so the digest saves cost but cannot *improve*
+    capture.
+
+    This version splits the work:
+
+      1. FOREGROUND — turns whose text matches a learning-signal cue
+         (corrections, preferences, "remember", durable persona/env facts,
+         fix/technique statements) are surfaced near-verbatim under an explicit
+         "POTENTIAL LEARNING SIGNALS" header, so the review model sees the
+         needle pulled out of the haystack.
+      2. ARC — every old turn still gets a short who-said-what / which-tools
+         line so the conversation's shape is preserved for context.
+
+    Deterministic, no LLM call. The review model still makes the final
+    save/no-op decision; we only raise the salience of the candidate turns.
     """
-    lines: List[str] = []
+    signals: List[str] = []
+    arc: List[str] = []
     for m in old or []:
         if not isinstance(m, dict):
             continue
         role = m.get("role")
+        text = _msg_text(m).replace("\n", " ")
         if role == "user":
-            c = m.get("content")
-            text = c if isinstance(c, str) else ""
-            if isinstance(c, list):
-                text = " ".join(
-                    b.get("text", "") for b in c if isinstance(b, dict)
-                )
-            text = (text or "").strip().replace("\n", " ")
             if text:
-                lines.append(f"USER: {text[:300]}")
+                arc.append(f"USER: {text[:300]}")
+                if _is_signal_turn(m):
+                    signals.append(f"USER said: \"{text[:500]}\"")
         elif role == "assistant":
             tcs = m.get("tool_calls") or []
             if tcs:
@@ -198,17 +257,25 @@ def _digest_old_messages(old: List[Dict]) -> str:
                     (tc.get("function") or {}).get("name", "?")
                     for tc in tcs if isinstance(tc, dict)
                 ]
-                lines.append(f"ASSISTANT[tools: {', '.join(names)}]")
-            c = m.get("content")
-            text = c if isinstance(c, str) else ""
-            text = (text or "").strip().replace("\n", " ")
+                arc.append(f"ASSISTANT[tools: {', '.join(names)}]")
             if text:
-                lines.append(f"ASSISTANT: {text[:200]}")
-    body = "\n".join(lines)
-    return (
-        "[Earlier conversation digest — older turns summarised to bound "
-        "review cost. Recent turns follow verbatim below.]\n" + body
-    )
+                arc.append(f"ASSISTANT: {text[:200]}")
+                if _is_signal_turn(m):
+                    signals.append(f"ASSISTANT noted: \"{text[:400]}\"")
+
+    parts = [
+        "[Earlier conversation digest — older turns summarised to bound review "
+        "cost. The recent turns follow VERBATIM after this digest.]"
+    ]
+    if signals:
+        parts.append(
+            "\nPOTENTIAL LEARNING SIGNALS from earlier turns (surfaced so they "
+            "aren't lost in summarisation — evaluate each for a memory/skill "
+            "save just as you would a verbatim turn):\n"
+            + "\n".join(f"  • {s}" for s in signals)
+        )
+    parts.append("\nConversation arc (compressed):\n" + "\n".join(arc))
+    return "\n".join(parts)
 
 
 def _build_review_history(
@@ -432,7 +499,18 @@ _COMBINED_REVIEW_PROMPT = (
     "**Memory**: who the user is. Did the user reveal persona, "
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
-    "preferences with the memory tool.\n\n"
+    "preferences with the memory tool. Be ACTIVE here too: a user who "
+    "states a standing fact or constraint — their environment/stack "
+    "('I run a 3-node Proxmox cluster', 'everything must stay "
+    "self-hosted/offline'), their identity/role, or an explicit "
+    "'keep this in mind / assume this / tailor to this / remember "
+    "this' — is handing you a FIRST-CLASS memory save. Save it even "
+    "when it appeared early and the rest of the session moved on to "
+    "unrelated work; durable context does not expire because the "
+    "conversation drifted. Prefer the most durable, decision-shaping "
+    "facts over transient trivia (today's weather, a one-off path): "
+    "when several candidates compete for limited memory, keep the "
+    "standing constraint, drop the ephemeral note.\n\n"
     "**Skills**: how to do this class of task. Be ACTIVE — most "
     "sessions produce at least one skill update. A pass that does "
     "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
