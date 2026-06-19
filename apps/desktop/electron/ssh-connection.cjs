@@ -80,12 +80,32 @@ function redactSecrets(text) {
 
 // Hash user@host:port to a short, stable, filesystem-safe socket id. Stable
 // across reconnects so ControlMaster reuse works; short so the full path stays
-// well under sun_path's 104-byte limit even under macOS's deeply nested
-// $TMPDIR (/var/folders/xx/yy/T/...). Mirrors ssh.py:53-67.
+// under sun_path's 104-byte limit.
+//
+// CRITICAL (macOS): the base dir must be SHORT. os.tmpdir() on macOS is the
+// per-user `/var/folders/xx/yyyy…/T/` (~49 bytes), and OpenSSH binds a
+// TEMPORARY listener at `<ControlPath>.<16 random chars>` (a 17-byte suffix)
+// while establishing the master — so a path that itself fits 104 still overflows
+// at bind time with `unix_listener: path "…" too long`. We root under a short
+// per-user base (`~/.hermes/desktop-ssh`) so even worst case
+// (~/.hermes/desktop-ssh = ~33 on macOS + 1 + 16 + 5 + 17 ≈ 72) stays clear.
+// Windows has no AF_UNIX sun_path limit, so os.tmpdir() is fine there. ssh.py
+// uses gettempdir() and would hit this on macOS — deliberate divergence.
 function controlSocketPath(user, host, port, baseDir) {
-  const dir = baseDir || path.join(os.tmpdir(), 'hermes-desktop-ssh')
+  const dir = baseDir || defaultControlDir()
   const id = crypto.createHash('sha256').update(`${user}@${host}:${port}`).digest('hex').slice(0, 16)
   return path.join(dir, `${id}.sock`)
+}
+
+function defaultControlDir() {
+  // Windows: AF_UNIX has no sun_path length limit → the per-user temp dir is
+  // fine. POSIX (macOS/Linux): a SHORT, PER-USER base — ~/.hermes/desktop-ssh —
+  // stays under the 104-byte socket limit AND avoids a world-shared /tmp dir
+  // (no foreign-owned-dir or symlink-hijack surface). Created 0700 in open().
+  if (process.platform === 'win32') {
+    return path.join(os.tmpdir(), 'hermes-desktop-ssh')
+  }
+  return path.join(os.homedir(), '.hermes', 'desktop-ssh')
 }
 
 // ---------------------------------------------------------------------------

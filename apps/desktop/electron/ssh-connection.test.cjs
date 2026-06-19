@@ -76,6 +76,21 @@ test('controlSocketPath is stable, short, and host-distinct', () => {
   assert.match(a, /\/[0-9a-f]{16}\.sock$/)
 })
 
+test('controlSocketPath default base stays under sun_path even with the temp-listener suffix', () => {
+  // OpenSSH binds a temporary listener at `<ControlPath>.<16 random chars>`
+  // (a 17-byte suffix) while opening the master. The macOS regression was the
+  // default base under os.tmpdir() (/var/folders/.../T/) pushing 89 → 106 bytes.
+  // The default base must keep socket + 17-byte suffix comfortably under 104.
+  const p = controlSocketPath('hermes', 'vbuddy-ubuntu', 22) // no baseDir → default
+  const worstCase = `${p}.0123456789abcdef` // mimic the .<16-char> temp suffix
+  assert.ok(
+    worstCase.length <= 104,
+    `default control socket + temp suffix must fit sun_path (got ${worstCase.length}: ${worstCase})`
+  )
+  // And it must NOT live under the deeply-nested macOS per-user temp dir.
+  assert.ok(!p.includes('/var/folders/'), 'default base must not be os.tmpdir() on macOS')
+})
+
 // --- command construction ---------------------------------------------------
 
 test('baseSshOptions carries the house ControlMaster/BatchMode/accept-new policy', () => {
