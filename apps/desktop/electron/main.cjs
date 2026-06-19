@@ -5277,6 +5277,12 @@ async function startHermes() {
         authMode: remote.authMode || 'token',
         token: remote.token,
         wsUrl: remote.wsUrl,
+        // Carry the SSH identity through so the statusbar pill reads "SSH: host"
+        // (not "Remote: 127.0.0.1") for a global SSH connection. Without these
+        // the primary-backend path drops them and the pill mislabels SSH as a
+        // plain token remote.
+        remoteHost: remote.remoteHost,
+        remoteKind: remote.remoteKind,
         logs: hermesLog.slice(-80),
         ...getWindowState()
       }
