@@ -1164,7 +1164,7 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     captured = {}
 
     class ProfileDB:
-        def update_session_cwd(self, session_id, cwd):
+        def update_session_cwd(self, session_id, cwd, git_branch=None, git_repo_root=None):
             captured["profile_update"] = (session_id, cwd)
 
         def close(self):

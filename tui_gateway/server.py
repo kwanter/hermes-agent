@@ -25,6 +25,7 @@ from hermes_constants import (
 )
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
+from tui_gateway import git_probe
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -178,6 +179,11 @@ _LONG_HANDLERS = frozenset(
         "browser.manage",
         "cli.exec",
         "plugins.manage",
+        "projects.discover_repos",
+        "projects.record_repos",
+        "projects.for_cwd",
+        "projects.tree",
+        "projects.project_sessions",
         "session.branch",
         "session.compress",
         "session.resume",
@@ -1115,31 +1121,14 @@ def _terminal_task_cwd(session: dict | None) -> str:
     return _session_cwd(session)
 
 
-def _git_branch_for_cwd(cwd: str) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "branch", "--show-current"],
-            capture_output=True,
-            text=True,
-            timeout=1.5,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
-        if result.returncode == 0:
-            branch = result.stdout.strip()
-            if branch:
-                return branch
-        head = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=1.5,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
-        return head.stdout.strip() if head.returncode == 0 else ""
-    except Exception:
-        return ""
+# Git working-tree probing (run git, resolve roots, fold worktrees) lives in a
+# focused, single-flight-cached module; these stay as the in-server names every
+# call site already uses.
+_git = git_probe.run_git
+_git_branch_for_cwd = git_probe.branch
+_git_repo_root_for_cwd = git_probe.repo_root
+_git_common_repo_root_for_cwd = git_probe.common_repo_root
+_resolve_cwd_git = git_probe.resolve
 
 
 def _session_cwd(session: dict | None) -> str:
@@ -1290,6 +1279,41 @@ def _session_db(session: dict):
                 db.close()
 
 
+def _persist_session_git_meta(session: dict, cwd: str) -> None:
+    """Resolve + persist a session's git branch / repo root WITHOUT blocking.
+
+    Branch and root come from ``git`` subprocess probes; running them inline on
+    the session-init / cwd-set path would stall startup whenever ``cwd`` is slow
+    or on an unreachable mount. Run them on a short-lived daemon thread instead
+    and persist via the same profile-aware db the caller writes ``cwd`` to.
+
+    Best-effort: ``cwd`` itself is persisted synchronously by the caller, so a
+    probe failure just leaves these enrichment columns unset (the project tree
+    falls back to its live resolver / lazy backfill). Daemon, so a mid-flight
+    probe never delays gateway shutdown.
+    """
+    session_key = session.get("session_key", "")
+    if not session_key or not cwd:
+        return
+    # Snapshot the routing fields now; the live session dict may be gone by the
+    # time the thread runs. `_session_db` reopens the profile-correct db inside.
+    db_session = {"session_key": session_key, "profile_home": session.get("profile_home")}
+
+    def _run() -> None:
+        try:
+            branch = _git_branch_for_cwd(cwd)
+            root = _git_common_repo_root_for_cwd(cwd)
+            if not (branch or root):
+                return
+            with _session_db(db_session) as db:
+                if db is not None:
+                    db.update_session_cwd(session_key, cwd, branch, root)
+        except Exception:
+            logger.debug("failed to persist session git metadata", exc_info=True)
+
+    threading.Thread(target=_run, name="git-meta", daemon=True).start()
+
+
 def _set_session_cwd(session: dict, cwd: str) -> str:
     resolved = os.path.abspath(os.path.expanduser(str(cwd)))
     if not os.path.isdir(resolved):
@@ -1305,6 +1329,8 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
                 db.update_session_cwd(session.get("session_key", ""), resolved)
             except Exception:
                 logger.debug("failed to persist session cwd", exc_info=True)
+    # Branch/repo-root probes are git subprocesses — capture them off the hot path.
+    _persist_session_git_meta(session, resolved)
     try:
         from tools.terminal_tool import cleanup_vm
 
@@ -3758,7 +3784,10 @@ def _init_session(
                     _sessions[sid]["cwd"] = row["cwd"]
         else:
             try:
-                db.update_session_cwd(key, _sessions[sid]["cwd"])
+                _cwd = _sessions[sid]["cwd"]
+                db.update_session_cwd(key, _cwd)
+                # git branch/root probes run off the hot path (see _set_session_cwd).
+                _persist_session_git_meta(_sessions[sid], _cwd)
             except Exception:
                 logger.debug("failed to persist resumed session cwd", exc_info=True)
     _register_session_cwd(_sessions[sid])
@@ -8045,6 +8074,434 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5001, str(e))
 
     return _err(rid, 4002, f"unknown config key: {key}")
+
+
+# ---------------------------------------------------------------------------
+# Projects — first-class, per-profile, multi-folder workspaces
+# ---------------------------------------------------------------------------
+
+
+# JSON-RPC error codes for the projects surface.
+_E_PROJECTS = 5061  # generic failure
+_E_NO_PROJECT = 5062  # id resolved to nothing
+_E_PROJECT_ARG = 5063  # invalid argument (e.g. bad name/slug)
+
+
+class _NoProject(Exception):
+    """Raised inside a projects handler when ``params['id']`` resolves to None."""
+
+
+def _projects_payload(conn) -> dict:
+    from hermes_cli import projects_db as pdb
+
+    return {
+        "projects": [p.to_dict() for p in pdb.list_projects(conn, include_archived=True)],
+        "active_id": pdb.get_active_id(conn),
+    }
+
+
+def _projects_method(name: str):
+    """Register a projects RPC, injecting (pdb, conn) and unifying error mapping.
+
+    Every project CRUD handler opened the per-profile DB, mapped a missing id to
+    5062, bad args to 5063, and everything else to 5061. This collapses that
+    boilerplate so each handler is just its one meaningful operation.
+    """
+
+    def decorator(fn):
+        @method(name)
+        def handler(rid, params: dict) -> dict:
+            try:
+                from hermes_cli import projects_db as pdb
+
+                with pdb.connect_closing() as conn:
+                    return fn(rid, params, pdb, conn)
+            except _NoProject:
+                return _err(rid, _E_NO_PROJECT, "no such project")
+            except ValueError as e:
+                return _err(rid, _E_PROJECT_ARG, str(e))
+            except Exception as e:
+                return _err(rid, _E_PROJECTS, str(e))
+
+        return handler
+
+    return decorator
+
+
+def _require_project(pdb, conn, params: dict):
+    """The project named by ``params['id']`` (or raise ``_NoProject``)."""
+    proj = pdb.get_project(conn, str(params.get("id") or ""))
+    if proj is None:
+        raise _NoProject
+    return proj
+
+
+@_projects_method("projects.list")
+def _(rid, params, pdb, conn) -> dict:
+    return _ok(rid, _projects_payload(conn))
+
+
+@_projects_method("projects.get")
+def _(rid, params, pdb, conn) -> dict:
+    return _ok(rid, {"project": _require_project(pdb, conn, params).to_dict()})
+
+
+@_projects_method("projects.create")
+def _(rid, params, pdb, conn) -> dict:
+    pid = pdb.create_project(
+        conn,
+        name=str(params.get("name") or ""),
+        slug=params.get("slug"),
+        folders=params.get("folders") or [],
+        primary_path=params.get("primary_path"),
+        description=params.get("description"),
+        icon=params.get("icon"),
+        color=params.get("color"),
+        board_slug=params.get("board_slug"),
+    )
+    if params.get("use"):
+        pdb.set_active(conn, pid)
+    proj = pdb.get_project(conn, pid)
+    return _ok(rid, {"project": proj.to_dict() if proj else None})
+
+
+@_projects_method("projects.update")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    pdb.update_project(
+        conn,
+        proj.id,
+        name=params.get("name"),
+        description=params.get("description"),
+        icon=params.get("icon"),
+        color=params.get("color"),
+        board_slug=params.get("board_slug"),
+    )
+    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+
+
+@_projects_method("projects.add_folder")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    pdb.add_folder(
+        conn,
+        proj.id,
+        str(params.get("path") or ""),
+        label=params.get("label"),
+        is_primary=bool(params.get("is_primary")),
+    )
+    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+
+
+@_projects_method("projects.remove_folder")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    pdb.remove_folder(conn, proj.id, str(params.get("path") or ""))
+    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+
+
+@_projects_method("projects.set_primary")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    pdb.set_primary(conn, proj.id, str(params.get("path") or ""))
+    return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+
+
+@_projects_method("projects.archive")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    (pdb.restore_project if params.get("restore") else pdb.archive_project)(conn, proj.id)
+    return _ok(rid, _projects_payload(conn))
+
+
+@_projects_method("projects.delete")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    pdb.delete_project(conn, proj.id)
+    return _ok(rid, _projects_payload(conn))
+
+
+@_projects_method("projects.set_active")
+def _(rid, params, pdb, conn) -> dict:
+    pdb.set_active(conn, _require_project(pdb, conn, params).id if params.get("id") else None)
+    return _ok(rid, {"active_id": pdb.get_active_id(conn)})
+
+
+@_projects_method("projects.for_cwd")
+def _(rid, params, pdb, conn) -> dict:
+    cwd = _completion_cwd({"cwd": str(params.get("cwd") or "").strip()} if params.get("cwd") else {})
+    proj = pdb.project_for_path(conn, cwd)
+    return _ok(rid, {"project": proj.to_dict() if proj else None, "cwd": cwd, "branch": _git_branch_for_cwd(cwd)})
+
+
+def _is_repo_junk(root: str) -> bool:
+    """A git root we never auto-surface as a project: the bare home dir or
+    anything under HERMES_HOME (~/.hermes by default) — config/sessions/skills,
+    not a workspace. User-created projects pointing there are still honored."""
+    if not root:
+        return True
+
+    from hermes_constants import get_hermes_home
+
+    real = os.path.realpath(root)
+    home = os.path.realpath(os.path.expanduser("~"))
+    hermes_home = os.path.realpath(str(get_hermes_home()))
+
+    return real == home or real == hermes_home or real.startswith(hermes_home + os.sep)
+
+
+def _discover_repos_payload(db, *, conn=None, backfill: bool = True) -> list[dict]:
+    """Merge filesystem-scanned repos (cached) with session-derived repo roots.
+
+    Repo-first: the disk scan (persisted by `projects.record_repos`) surfaces
+    repos even with zero hermes sessions. Session-derived roots cover repos
+    outside the scan roots. Both are junk-filtered (hermes home subtree + bare
+    home) and carry their session totals for the overview.
+
+    ``conn`` reuses an already-open projects.db connection (the tree path holds
+    one); ``backfill`` persists resolved roots back onto session rows — kept off
+    the per-turn tree path (grouping uses the live git resolver regardless) and
+    done only on the explicit discover/record refresh.
+    """
+    _is_junk = _is_repo_junk
+    repos: dict[str, dict] = {}
+
+    def _agg(root: str) -> dict:
+        return repos.setdefault(root, {"root": root, "label": "", "sessions": 0, "last_active": 0.0})
+
+    # Session-derived roots (common repo root, folding worktrees; cached) +
+    # backfill the column so persisted git_repo_root matches the tree grouping.
+    cwd_rows = list(db.distinct_session_cwds())
+    # Warm the per-cwd git probes in parallel so a cold first paint doesn't
+    # serialize one subprocess per distinct cwd before this loop reads the cache.
+    git_probe.warm_roots(str(r.get("cwd") or "") for r in cwd_rows)
+    cwd_to_root: dict[str, str] = {}
+    for row in cwd_rows:
+        cwd = str(row.get("cwd") or "")
+        root = _git_common_repo_root_for_cwd(cwd)
+        if not root:
+            continue
+        cwd_to_root[cwd] = root
+        if _is_junk(root):
+            continue
+        agg = _agg(root)
+        agg["sessions"] += int(row.get("sessions") or 0)
+        agg["last_active"] = max(agg["last_active"], float(row.get("last_active") or 0))
+
+    if backfill:
+        try:
+            db.backfill_repo_roots(cwd_to_root)
+        except Exception:
+            logger.debug("failed to backfill repo roots", exc_info=True)
+
+    # Filesystem-scanned roots from the cache (may have zero sessions). Reuse the
+    # caller's projects.db connection when given, else open a short-lived one.
+    try:
+        from hermes_cli import projects_db as pdb
+
+        def _read(c) -> None:
+            for entry in pdb.list_discovered_repos(c):
+                root = str(entry.get("root") or "")
+                if not root or _is_junk(root):
+                    continue
+                agg = _agg(root)
+                if entry.get("label"):
+                    agg["label"] = entry["label"]
+                agg["last_active"] = max(agg["last_active"], float(entry.get("last_seen") or 0))
+
+        if conn is not None:
+            _read(conn)
+        else:
+            with pdb.connect_closing() as own:
+                _read(own)
+    except Exception:
+        logger.debug("failed to read discovered repo cache", exc_info=True)
+
+    out = sorted(repos.values(), key=lambda r: r["last_active"], reverse=True)
+    for r in out:
+        r["label"] = r["label"] or os.path.basename(r["root"].rstrip("/\\")) or r["root"]
+    return out
+
+
+@method("projects.discover_repos")
+def _(rid, params: dict) -> dict:
+    """Repos for the desktop overview: scanned-from-disk (cached) ∪ session-derived."""
+    try:
+        db = _get_db()
+        if db is None:
+            return _ok(rid, {"repos": []})
+        return _ok(rid, {"repos": _discover_repos_payload(db)})
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.record_repos")
+def _(rid, params: dict) -> dict:
+    """Persist git repo roots found by the client's filesystem scan, then return
+    the merged repo list. The native crawl runs on the desktop (local fs); this
+    caches the result so later reads are instant instead of re-walking disk."""
+    try:
+        from hermes_cli import projects_db as pdb
+
+        pairs: list[tuple[str, str | None]] = []
+        for item in params.get("repos") or []:
+            if isinstance(item, str):
+                pairs.append((item, None))
+            elif isinstance(item, dict) and item.get("root"):
+                pairs.append((str(item["root"]), item.get("label")))
+
+        with pdb.connect_closing() as conn:
+            pdb.record_discovered_repos(conn, pairs, replace=True)
+
+        db = _get_db()
+        return _ok(rid, {"repos": _discover_repos_payload(db) if db is not None else []})
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+# Sources excluded from the project tree: cron runs and tool/subagent children
+# are not user conversations. Subagent/compression children are already dropped
+# by list_sessions_rich(include_children=False); cron has its own section.
+_PROJECT_TREE_EXCLUDED_SOURCES = ["cron"]
+
+
+def _project_tree_row(r: dict) -> dict:
+    """Project a SessionDB row to the minimal shape the sidebar renders.
+
+    Keeps the fields the grouping needs (cwd / git_branch / git_repo_root) plus
+    everything ``SidebarSessionRow`` reads, and drops the heavy columns
+    (system_prompt, model_config, ...) so the tree payload stays lean.
+    """
+    return {
+        "id": r.get("id"),
+        "_lineage_root_id": r.get("_lineage_root_id"),
+        "title": r.get("title"),
+        "preview": r.get("preview"),
+        "started_at": r.get("started_at") or 0,
+        "ended_at": r.get("ended_at"),
+        "last_active": r.get("last_active") or r.get("started_at") or 0,
+        "source": r.get("source"),
+        "archived": bool(r.get("archived")),
+        "message_count": r.get("message_count") or 0,
+        "tool_call_count": r.get("tool_call_count") or 0,
+        "input_tokens": r.get("input_tokens") or 0,
+        "output_tokens": r.get("output_tokens") or 0,
+        "model": r.get("model"),
+        "is_active": False,
+        "cwd": r.get("cwd"),
+        "git_branch": r.get("git_branch"),
+        "git_repo_root": r.get("git_repo_root"),
+    }
+
+
+def _project_tree_inputs(
+    db, session_limit: int, *, include_discovered: bool
+) -> tuple[list[dict], list[dict], list[dict], str | None]:
+    """Gather (sessions, projects, discovered_repos, active_id) for build_tree.
+
+    ``include_discovered`` is the zero-session-repo overview tier; the entered
+    view (drill-in) skips it entirely — it only needs the project it's showing,
+    which already has sessions — avoiding the distinct-cwd scan + git probes on
+    that per-turn path. One projects.db connection serves both reads.
+    """
+    rows = db.list_sessions_rich(
+        limit=session_limit,
+        offset=0,
+        order_by_last_active=True,
+        min_message_count=1,
+        include_children=False,
+        exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
+        include_archived=False,
+    )
+    sessions = [_project_tree_row(r) for r in rows]
+    # Parallel-warm the git cache so build_tree's resolver reads it instead of
+    # cold-probing each cwd in sequence (matters on the drill-in path, which
+    # skips the discovery warm-up below).
+    git_probe.warm_roots(s["cwd"] for s in sessions if s.get("cwd"))
+
+    from hermes_cli import projects_db as pdb
+
+    with pdb.connect_closing() as conn:
+        projects = [p.to_dict() for p in pdb.list_projects(conn)]
+        active_id = pdb.get_active_id(conn)
+        # backfill stays off the hot tree path — grouping uses the live resolver.
+        discovered = _discover_repos_payload(db, conn=conn, backfill=False) if include_discovered else []
+
+    return sessions, projects, discovered, active_id
+
+
+def _build_project_tree(
+    db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool
+) -> tuple[dict, str | None]:
+    """Gather inputs and run the one authoritative builder. Returns (tree, active_id)."""
+    from tui_gateway import project_tree
+
+    sessions, projects, discovered, active_id = _project_tree_inputs(
+        db, session_limit, include_discovered=include_discovered
+    )
+    tree = project_tree.build_tree(
+        projects,
+        sessions,
+        discovered,
+        _resolve_cwd_git,
+        preview_limit=preview_limit,
+        hydrate=hydrate,
+        is_junk_root=_is_repo_junk,
+    )
+    return tree, active_id
+
+
+@method("projects.tree")
+def _(rid, params: dict) -> dict:
+    """Authoritative project overview: project -> repo -> lane structure with
+    counts + a few preview sessions per project, plus the flat set of session
+    ids claimed by any project (so the desktop excludes them from flat Recents).
+    Lanes carry no session rows here; drill-in uses ``projects.project_sessions``.
+    """
+    try:
+        db = _get_db()
+        if db is None:
+            return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
+
+        tree, active_id = _build_project_tree(
+            db,
+            preview_limit=int(params.get("preview_limit") or 3),
+            hydrate=False,
+            session_limit=int(params.get("session_limit") or 2000),
+            include_discovered=True,
+        )
+        return _ok(
+            rid,
+            {"projects": tree["projects"], "active_id": active_id, "scoped_session_ids": tree["scoped_session_ids"]},
+        )
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.project_sessions")
+def _(rid, params: dict) -> dict:
+    """Fully hydrated lanes (repo -> lane -> session rows) for one project,
+    built from the same authoritative grouping as ``projects.tree`` so ids and
+    membership match exactly. Used when the user enters a project."""
+    try:
+        project_id = str(params.get("project_id") or "")
+        if not project_id:
+            return _err(rid, 5063, "project_id required")
+
+        db = _get_db()
+        if db is None:
+            return _ok(rid, {"project": None})
+
+        # Drill-in only needs the entered project (which has sessions), so skip
+        # the zero-session discovery tier entirely.
+        tree, _active = _build_project_tree(
+            db, preview_limit=0, hydrate=True, session_limit=int(params.get("session_limit") or 5000),
+            include_discovered=False,
+        )
+        proj = next((p for p in tree["projects"] if p["id"] == project_id), None)
+        return _ok(rid, {"project": proj})
+    except Exception as e:
+        return _err(rid, 5061, str(e))
 
 
 @method("config.get")
