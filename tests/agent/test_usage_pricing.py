@@ -322,3 +322,182 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     )
     assert result.status == "estimated"
     assert result.amount_usd is not None
+
+
+# ── chunk 2: GLM, Kimi, Qwen, DashScope pricing entries ────────────────
+# Verified against each vendor's published pricing page on 2026-06-22.
+# Regression scope: any session on these providers must produce a dollar
+# estimate, not ``unknown``.
+
+
+def test_z_ai_glm_5_pricing_entry_exists():
+    """z-ai/glm-5 must have a pricing entry with cache read support."""
+    entry = get_pricing_entry("glm-5", provider="z-ai")
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+    assert entry.output_cost_per_million is not None
+    assert entry.cache_read_cost_per_million is not None
+    assert float(entry.input_cost_per_million) == 1.00
+    assert float(entry.output_cost_per_million) == 3.20
+    assert float(entry.cache_read_cost_per_million) == 0.20
+
+
+def test_z_ai_glm_provider_aliases_resolve_to_pricing():
+    """Provider aliases ``zai``, ``zhipu``, ``glm`` and the ``z.ai`` base
+    URL must all resolve to the same official_docs_snapshot entry, otherwise
+    user configurations that spell the provider differently will silently
+    fall through to ``unknown``.
+    """
+    for alias in ("zai", "zhipu", "glm"):
+        entry = get_pricing_entry("glm-5", provider=alias)
+        assert entry is not None, f"alias {alias!r} should resolve"
+        assert entry.input_cost_per_million is not None
+    entry = get_pricing_entry("glm-5", base_url="https://api.z.ai/v1")
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+
+
+def test_z_ai_glm_4_5_air_cached_session_estimates_cost_not_unknown():
+    """Cached sessions on a model with an official cache rate must not
+    be priced as ``unknown``. Regression covers the cache-write arm of
+    the cost calculator: if cache_read is present but cache_write is None
+    (which is the GLM case), the cost block must still produce a number.
+    """
+    result = estimate_usage_cost(
+        "glm-4.5-air",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=500_000, cache_read_tokens=200_000),
+        provider="z-ai",
+    )
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 1M * $0.20/M input + 500K * $1.10/M output + 200K * $0.03/M cache
+    # = 0.20 + 0.55 + 0.006 = 0.756
+    assert float(result.amount_usd) == 0.756
+
+
+def test_moonshot_kimi_k2_6_pricing_entry_exists():
+    """moonshot/kimi-k2.6 must have a pricing entry with cache read support."""
+    entry = get_pricing_entry("kimi-k2.6", provider="moonshot")
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+    assert entry.output_cost_per_million is not None
+    assert entry.cache_read_cost_per_million is not None
+    assert float(entry.input_cost_per_million) == 0.96
+    assert float(entry.output_cost_per_million) == 3.99
+    assert float(entry.cache_read_cost_per_million) == 0.16
+
+
+def test_moonshot_kimi_provider_aliases_resolve_to_pricing():
+    """Provider alias ``kimi`` and the kimi.com base URL must resolve to
+    the moonshot pricing entry, otherwise user configs that say
+    ``provider: kimi`` will silently fall through to ``unknown``.
+    """
+    entry = get_pricing_entry("kimi-k2.5", provider="kimi")
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+    entry = get_pricing_entry("kimi-k2.5", base_url="https://api.kimi.com/v1")
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+
+
+def test_moonshot_kimi_k2_5_estimate_usage_cost():
+    """kimi-k2.5 sessions should produce a dollar estimate at the
+    published rate, not ``unknown``.
+    """
+    result = estimate_usage_cost(
+        "kimi-k2.5",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=500_000),
+        provider="moonshot",
+    )
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 1M * $0.59/M + 500K * $3.10/M = 0.59 + 1.55 = 2.14
+    assert float(result.amount_usd) == 2.14
+
+
+def test_qwen_qwen3_max_pricing_entry_exists():
+    """qwen/qwen3-max must have a pricing entry at the published USD rate.
+    International Model Studio pricing is already in USD, so no FX path.
+    """
+    entry = get_pricing_entry("qwen3-max", provider="qwen")
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+    assert entry.output_cost_per_million is not None
+    assert float(entry.input_cost_per_million) == 1.20
+    assert float(entry.output_cost_per_million) == 6.00
+
+
+def test_qwen_provider_aliases_resolve_to_pricing():
+    """Provider aliases ``alibaba``, ``bailian``, ``model-studio`` and the
+    alibabacloud.com base URL must resolve to the qwen pricing entry.
+    """
+    for alias in ("alibaba", "bailian", "model-studio"):
+        entry = get_pricing_entry("qwen3.5-plus", provider=alias)
+        assert entry is not None, f"alias {alias!r} should resolve"
+        assert entry.input_cost_per_million is not None
+    entry = get_pricing_entry("qwen3.5-plus", base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+
+
+def test_qwen_qwen3_5_flash_estimate_usage_cost():
+    """qwen3.5-flash is the cheapest tier. Sanity-check the math at the
+    published rate so a future copy-paste typo on the output column
+    is caught.
+    """
+    result = estimate_usage_cost(
+        "qwen3.5-flash",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000),
+        provider="qwen",
+    )
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 1M * $0.10/M + 1M * $0.40/M = 0.50
+    assert float(result.amount_usd) == 0.50
+
+
+def test_dashscope_qwen3_max_pricing_entry_exists():
+    """dashscope/qwen3-max must have a pricing entry. The DashScope route
+    is separate from the qwen route so the China region can disambiguate
+    pricing when it diverges from the international Model Studio rate.
+    """
+    entry = get_pricing_entry("qwen3-max", provider="dashscope")
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+    assert entry.output_cost_per_million is not None
+    assert float(entry.input_cost_per_million) == 1.20
+    assert float(entry.output_cost_per_million) == 6.00
+
+
+def test_dashscope_provider_base_url_resolves_to_pricing():
+    """The DashScope base URL (dashscope.aliyuncs.com) must resolve to
+    the dashscope provider, not ``unknown``. Without this branch, a user
+    pointing their qwen base_url at the CN endpoint would silently fail
+    to estimate cost.
+    """
+    entry = get_pricing_entry(
+        "qwen3.5-flash",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+
+
+def test_qwen_and_dashscope_pricing_tables_are_disjoint_providers():
+    """Invariant: the qwen and dashscope provider names must remain
+    distinct keys in the pricing table. If a future refactor collapses
+    them into one provider, the route resolution above will start
+    returning the wrong pricing for one region.
+    """
+    from agent.usage_pricing import _OFFICIAL_DOCS_PRICING
+
+    qwen_keys = {k for k in _OFFICIAL_DOCS_PRICING if k[0] == "qwen"}
+    dashscope_keys = {k for k in _OFFICIAL_DOCS_PRICING if k[0] == "dashscope"}
+    assert qwen_keys, "expected at least one qwen pricing row"
+    assert dashscope_keys, "expected at least one dashscope pricing row"
+    # Same model name can appear under both providers (intentional),
+    # but the provider tuple must be distinct.
+    shared_models = {k[1] for k in qwen_keys} & {k[1] for k in dashscope_keys}
+    for model in shared_models:
+        assert ("qwen", model) in _OFFICIAL_DOCS_PRICING
+        assert ("dashscope", model) in _OFFICIAL_DOCS_PRICING

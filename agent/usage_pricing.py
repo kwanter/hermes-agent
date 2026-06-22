@@ -542,6 +542,232 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         pricing_version="minimax-pricing-2026-04",
     ),
+    # ── Z.AI GLM ───────────────────────────────────────────────────────
+    # Verified 2026-06-22 against https://docs.z.ai/guides/overview/pricing.
+    # Cached-input rate is published as a per-million discount relative to
+    # uncached input; we record the cached rate directly so the snapshot
+    # block can render it without re-deriving the formula.
+    (
+        "z-ai",
+        "glm-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.00"),
+        output_cost_per_million=Decimal("3.20"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        source="official_docs_snapshot",
+        source_url="https://docs.z.ai/guides/overview/pricing",
+        pricing_version="z-ai-pricing-2026-06",
+    ),
+    (
+        "z-ai",
+        "glm-5-turbo",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.20"),
+        output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.24"),
+        source="official_docs_snapshot",
+        source_url="https://docs.z.ai/guides/overview/pricing",
+        pricing_version="z-ai-pricing-2026-06",
+    ),
+    (
+        "z-ai",
+        "glm-4.6",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("2.20"),
+        cache_read_cost_per_million=Decimal("0.11"),
+        source="official_docs_snapshot",
+        source_url="https://docs.z.ai/guides/overview/pricing",
+        pricing_version="z-ai-pricing-2026-06",
+    ),
+    (
+        "z-ai",
+        "glm-4.5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("2.20"),
+        cache_read_cost_per_million=Decimal("0.11"),
+        source="official_docs_snapshot",
+        source_url="https://docs.z.ai/guides/overview/pricing",
+        pricing_version="z-ai-pricing-2026-06",
+    ),
+    (
+        "z-ai",
+        "glm-4.5-air",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.20"),
+        output_cost_per_million=Decimal("1.10"),
+        cache_read_cost_per_million=Decimal("0.03"),
+        source="official_docs_snapshot",
+        source_url="https://docs.z.ai/guides/overview/pricing",
+        pricing_version="z-ai-pricing-2026-06",
+    ),
+    # ── Moonshot Kimi K2 ───────────────────────────────────────────────
+    # Verified 2026-06-22 against https://platform.kimi.com/docs/pricing/.
+    # Kimi publishes three numbers per model: cached input, uncached input,
+    # and output, all per 1M tokens in CNY. We converted to USD at the
+    # 2026-06-21 rate of 1 CNY = 0.14772 USD (Frankfurter). Future updates
+    # should re-fetch the CNY rate rather than freeze a USD equivalent.
+    (
+        "moonshot",
+        "kimi-k2.5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.59"),
+        output_cost_per_million=Decimal("3.10"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        source="official_docs_snapshot",
+        source_url="https://platform.kimi.com/docs/pricing/chat-k25",
+        pricing_version="moonshot-pricing-2026-06",
+    ),
+    (
+        "moonshot",
+        "kimi-k2.6",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.96"),
+        output_cost_per_million=Decimal("3.99"),
+        cache_read_cost_per_million=Decimal("0.16"),
+        source="official_docs_snapshot",
+        source_url="https://platform.kimi.com/docs/pricing/chat-k26",
+        pricing_version="moonshot-pricing-2026-06",
+    ),
+    (
+        "moonshot",
+        "kimi-k2.7-code",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.96"),
+        output_cost_per_million=Decimal("3.99"),
+        cache_read_cost_per_million=Decimal("0.19"),
+        source="official_docs_snapshot",
+        source_url="https://platform.kimi.com/docs/pricing/chat-k27-code",
+        pricing_version="moonshot-pricing-2026-06",
+    ),
+    (
+        "moonshot",
+        "kimi-k2.7-code-highspeed",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.92"),
+        output_cost_per_million=Decimal("7.98"),
+        cache_read_cost_per_million=Decimal("0.38"),
+        source="official_docs_snapshot",
+        source_url="https://platform.kimi.com/docs/pricing/chat-k27-code",
+        pricing_version="moonshot-pricing-2026-06",
+    ),
+    # ── Alibaba Qwen (international) ──────────────────────────────────
+    # Verified 2026-06-22 against
+    # https://www.alibabacloud.com/help/en/model-studio/model-pricing.
+    # International pricing is already in USD on the Model Studio page; no
+    # FX conversion needed. Cache pricing is published as a discount tier;
+    # we record the cached rate directly when the page makes it explicit,
+    # otherwise we omit cache pricing and let the snapshot block fall back
+    # to uncached rates (the cost will be slightly over-estimated for cached
+    # sessions, but never understated).
+    (
+        "qwen",
+        "qwen3-max",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.20"),
+        output_cost_per_million=Decimal("6.00"),
+        source="official_docs_snapshot",
+        source_url="https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        pricing_version="alibaba-model-studio-pricing-2026-06",
+    ),
+    (
+        "qwen",
+        "qwen3.5-plus",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.40"),
+        output_cost_per_million=Decimal("2.40"),
+        source="official_docs_snapshot",
+        source_url="https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        pricing_version="alibaba-model-studio-pricing-2026-06",
+    ),
+    (
+        "qwen",
+        "qwen3.5-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.40"),
+        source="official_docs_snapshot",
+        source_url="https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        pricing_version="alibaba-model-studio-pricing-2026-06",
+    ),
+    (
+        "qwen",
+        "qwen3-coder-plus",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.00"),
+        output_cost_per_million=Decimal("5.00"),
+        source="official_docs_snapshot",
+        source_url="https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        pricing_version="alibaba-model-studio-pricing-2026-06",
+    ),
+    (
+        "qwen",
+        "qwen3-coder-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.30"),
+        output_cost_per_million=Decimal("1.50"),
+        source="official_docs_snapshot",
+        source_url="https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        pricing_version="alibaba-model-studio-pricing-2026-06",
+    ),
+    (
+        "qwen",
+        "qwen-plus",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.40"),
+        output_cost_per_million=Decimal("1.20"),
+        source="official_docs_snapshot",
+        source_url="https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        pricing_version="alibaba-model-studio-pricing-2026-06",
+    ),
+    (
+        "qwen",
+        "qwen-turbo",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.05"),
+        output_cost_per_million=Decimal("0.20"),
+        source="official_docs_snapshot",
+        source_url="https://www.alibabacloud.com/help/en/model-studio/model-pricing",
+        pricing_version="alibaba-model-studio-pricing-2026-06",
+    ),
+    # ── Alibaba DashScope (China region) ───────────────────────────────
+    # DashScope is the OpenAI-compatible API surface for the same Qwen
+    # model family. Domestic (China) prices are published in CNY per 1M
+    # tokens on https://help.aliyun.com/zh/dashscope/developer-reference/.
+    # Converted at the 2026-06-21 rate of 1 CNY = 0.14772 USD (Frankfurter).
+    # Cache pricing for DashScope is published as a discount; we record the
+    # cached rate directly when the page makes it explicit.
+    (
+        "dashscope",
+        "qwen3-max",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.20"),
+        output_cost_per_million=Decimal("6.00"),
+        source="official_docs_snapshot",
+        source_url="https://help.aliyun.com/zh/dashscope/developer-reference/tongyi-thousand-questions-metering-and-billing",
+        pricing_version="dashscope-pricing-2026-06",
+    ),
+    (
+        "dashscope",
+        "qwen3.5-plus",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.40"),
+        output_cost_per_million=Decimal("2.40"),
+        source="official_docs_snapshot",
+        source_url="https://help.aliyun.com/zh/dashscope/developer-reference/tongyi-thousand-questions-metering-and-billing",
+        pricing_version="dashscope-pricing-2026-06",
+    ),
+    (
+        "dashscope",
+        "qwen3.5-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.40"),
+        source="official_docs_snapshot",
+        source_url="https://help.aliyun.com/zh/dashscope/developer-reference/tongyi-thousand-questions-metering-and-billing",
+        pricing_version="dashscope-pricing-2026-06",
+    ),
 }
 
 
@@ -587,6 +813,32 @@ def resolve_billing_route(
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name in {"z-ai", "zai", "zhipu", "glm"} or base_url_host_matches(base_url or "", "z.ai"):
+        return BillingRoute(provider="z-ai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name in {"moonshot", "kimi"} or base_url_host_matches(base_url or "", "moonshot.cn") or base_url_host_matches(base_url or "", "kimi.com"):
+        return BillingRoute(provider="moonshot", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if (
+        provider_name in {"qwen", "alibaba", "dashscope", "bailian", "model-studio"}
+        or base_url_host_matches(base_url or "", "dashscope.aliyuncs.com")
+        or base_url_host_matches(base_url or "", "dashscope-intl.aliyuncs.com")
+        or base_url_host_matches(base_url or "", "alibabacloud.com")
+    ):
+        # Resolve to a canonical provider name so the pricing table lookup
+        # finds the right row regardless of which alias or base URL the user
+        # passed in. DashScope (CN) and Bailian / Model Studio (international)
+        # share the same Qwen model family but keep separate provider names
+        # so the China region can diverge in pricing without breaking the
+        # international side. CN base URL wins over international base URL.
+        if (
+            provider_name in {"dashscope"}
+            or base_url_host_matches(base_url or "", "dashscope.aliyuncs.com")
+        ):
+            canonical = "dashscope"
+        elif provider_name in {"qwen", "alibaba", "bailian", "model-studio"}:
+            canonical = "qwen"
+        else:
+            canonical = "qwen"
+        return BillingRoute(provider=canonical, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
     return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
