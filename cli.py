@@ -4273,6 +4273,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
+        # Per-session cost. Opt-in via display.show_cost. Cheap to compute
+        # (in-process Decimal math), runs in the same 1Hz redraw loop that
+        # already touches the snapshot. cost_label is the compact rendering
+        # ("$0.08" / "incl" / "n/a") so the wide-tier status bar can drop it
+        # straight into the layout without re-deriving format.
+        if agent and (CLI_CONFIG.get("display", {}) or {}).get("show_cost", False):
+            try:
+                cost_result = estimate_usage_cost(
+                    agent.model,
+                    CanonicalUsage(
+                        input_tokens=snapshot["session_input_tokens"],
+                        output_tokens=snapshot["session_output_tokens"],
+                        cache_read_tokens=snapshot["session_cache_read_tokens"],
+                        cache_write_tokens=snapshot["session_cache_write_tokens"],
+                    ),
+                    provider=getattr(agent, "provider", None),
+                    base_url=getattr(agent, "base_url", None),
+                )
+                snapshot["cost_usd"] = (
+                    float(cost_result.amount_usd)
+                    if cost_result.amount_usd is not None
+                    else None
+                )
+                snapshot["cost_status"] = cost_result.status  # actual/estimated/included/unknown
+                snapshot["cost_source"] = cost_result.source
+                if cost_result.status == "included":
+                    snapshot["cost_label"] = "incl"
+                elif cost_result.amount_usd is not None:
+                    prefix = "~" if cost_result.status == "estimated" else ""
+                    snapshot["cost_label"] = f"{prefix}${cost_result.amount_usd:.4f}"
+                else:
+                    snapshot["cost_label"] = "n/a"
+            except Exception:
+                # Cost is decorative: never let it break the status bar.
+                snapshot["cost_usd"] = None
+                snapshot["cost_status"] = "unknown"
+                snapshot["cost_source"] = "none"
+                snapshot["cost_label"] = "n/a"
+        else:
+            snapshot["cost_usd"] = None
+            snapshot["cost_status"] = None
+            snapshot["cost_source"] = None
+            snapshot["cost_label"] = None
+
         return snapshot
 
     @staticmethod
@@ -4508,6 +4552,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
             if compressions:
                 parts.append(f"🗜️ {compressions}")
+            cost_label = snapshot.get("cost_label")
+            if cost_label:
+                parts.append(cost_label)
             bg_count = snapshot.get("active_background_tasks", 0)
             if bg_count:
                 parts.append(f"▶ {bg_count}")
@@ -4607,6 +4654,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
+                    cost_label = snapshot.get("cost_label")
+                    if cost_label:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-cost", cost_label))
                     if bg_count:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-strong", f"▶ {bg_count}"))
@@ -13864,6 +13915,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
             'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
             'status-bar-yolo': 'bg:#1a1a2e #FF4444 bold',
+            'status-bar-cost': 'bg:#1a1a2e #98D8AA bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges

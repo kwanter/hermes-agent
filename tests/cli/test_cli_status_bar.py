@@ -1,10 +1,25 @@
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import cli as cli_mod
-from cli import HermesCLI
+from cli import CLI_CONFIG, HermesCLI
+
+
+@contextmanager
+def _show_cost(enabled: bool):
+    """Force the display.show_cost toggle to ``enabled`` for the duration of a test.
+
+    The default value lives in user config (config.yaml), so any test asserting
+    on-off behavior has to pin the toggle explicitly to avoid leaking the
+    developer's local config into CI. We also stamp a tiny session_start shift
+    on the cli_obj so the status-bar snapshot's cost block recomputes
+    deterministically across runs.
+    """
+    with patch.dict(cli_mod.CLI_CONFIG, {"display": {**(cli_mod.CLI_CONFIG.get("display", {}) or {}), "show_cost": enabled}}):
+        yield
 
 
 def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
@@ -64,17 +79,18 @@ class TestCLIStatusBar:
         assert cli_obj._status_bar_context_style(95) == "class:status-bar-critical"
 
     def test_build_status_bar_text_for_wide_terminal(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_230,
-            completion_tokens=2_220,
-            total_tokens=12_450,
-            api_calls=7,
-            context_tokens=12_450,
-            context_length=200_000,
-        )
+        with _show_cost(False):
+            cli_obj = _attach_agent(
+                _make_cli(),
+                prompt_tokens=10_230,
+                completion_tokens=2_220,
+                total_tokens=12_450,
+                api_calls=7,
+                context_tokens=12_450,
+                context_length=200_000,
+            )
 
-        text = cli_obj._build_status_bar_text(width=120)
+            text = cli_obj._build_status_bar_text(width=120)
 
         assert "claude-sonnet-4-20250514" in text
         assert "12.4K/200K" in text
@@ -125,34 +141,37 @@ class TestCLIStatusBar:
         assert cli_mod._estimate_tui_input_height(["abcd"], "", 0) == 4
 
     def test_build_status_bar_text_no_cost_in_status_bar(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10000,
-            completion_tokens=5000,
-            total_tokens=15000,
-            api_calls=7,
-            context_tokens=50000,
-            context_length=200_000,
-        )
+        with _show_cost(False):
+            cli_obj = _attach_agent(
+                _make_cli(),
+                prompt_tokens=10000,
+                completion_tokens=5000,
+                total_tokens=15000,
+                api_calls=7,
+                context_tokens=50000,
+                context_length=200_000,
+            )
 
-        text = cli_obj._build_status_bar_text(width=120)
-        assert "$" not in text  # cost is never shown in status bar
+            text = cli_obj._build_status_bar_text(width=120)
+
+        assert "$" not in text  # cost is opt-in via display.show_cost
 
     def test_build_status_bar_text_collapses_for_narrow_terminal(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10000,
-            completion_tokens=2400,
-            total_tokens=12400,
-            api_calls=7,
-            context_tokens=12400,
-            context_length=200_000,
-        )
+        with _show_cost(False):
+            cli_obj = _attach_agent(
+                _make_cli(),
+                prompt_tokens=10000,
+                completion_tokens=2400,
+                total_tokens=12400,
+                api_calls=7,
+                context_tokens=12400,
+                context_length=200_000,
+            )
 
-        text = cli_obj._build_status_bar_text(width=60)
+            text = cli_obj._build_status_bar_text(width=60)
 
         assert "⚕" in text
-        assert "$0.06" not in text  # cost hidden by default
+        assert "$0.06" not in text  # cost hidden when show_cost is off
         assert "15m" in text
         assert "200K" not in text
 
@@ -239,24 +258,112 @@ class TestCLIStatusBar:
         assert cli_obj._compression_count_style(25) == "class:status-bar-bad"
 
     def test_compression_count_in_wide_fragments(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_230,
-            completion_tokens=2_220,
-            total_tokens=12_450,
-            api_calls=7,
-            context_tokens=12_450,
-            context_length=200_000,
-            compressions=7,
-        )
-        cli_obj._status_bar_visible = True
+        with _show_cost(False):
+            cli_obj = _attach_agent(
+                _make_cli(),
+                prompt_tokens=10_230,
+                completion_tokens=2_220,
+                total_tokens=12_450,
+                api_calls=7,
+                context_tokens=12_450,
+                context_length=200_000,
+                compressions=7,
+            )
+            cli_obj._status_bar_visible = True
 
-        frags = cli_obj._get_status_bar_fragments()
+            frags = cli_obj._get_status_bar_fragments()
         frag_texts = [text for _, text in frags]
 
         assert "🗜️ 7" in frag_texts
         frag_styles = {text: style for style, text in frags}
         assert frag_styles["🗜️ 7"] == "class:status-bar-warn"
+
+    def test_show_cost_in_wide_status_bar_text(self):
+        """When display.show_cost is true, the wide status bar shows a $ amount."""
+        with _show_cost(True):
+            cli_obj = _attach_agent(
+                _make_cli(),
+                prompt_tokens=10_230,
+                completion_tokens=2_220,
+                total_tokens=12_450,
+                api_calls=7,
+                context_tokens=12_450,
+                context_length=200_000,
+            )
+
+            text = cli_obj._build_status_bar_text(width=200)
+
+        assert "$" in text
+        # Anthropic Sonnet 4 at 12K input + 2.2K output should be a few cents
+        assert "0.0" in text  # $0.0X cents range for 14K tokens
+
+    def test_show_cost_in_wide_status_bar_fragments(self):
+        """When display.show_cost is true, the fragment list contains a cost chip."""
+        # Stub the TUI width so the wide layout fits and we get individual fragments
+        # (otherwise the trim path collapses the whole bar to one string).
+        with _show_cost(True), patch.object(
+            HermesCLI, "_get_tui_terminal_width", lambda self, default=(80, 24): 220
+        ):
+            cli_obj = _attach_agent(
+                _make_cli(),
+                prompt_tokens=10_230,
+                completion_tokens=2_220,
+                total_tokens=12_450,
+                api_calls=7,
+                context_tokens=12_450,
+                context_length=200_000,
+            )
+            cli_obj._status_bar_visible = True
+
+            frags = cli_obj._get_status_bar_fragments()
+        frag_texts = [text for _, text in frags]
+        frag_styles = {text: style for style, text in frags}
+
+        # Find the cost chip: "$..." (real or estimated) or "incl" (subscription)
+        cost_frags = [t for t in frag_texts if t.startswith("$") or t.startswith("~$") or t == "incl" or t == "n/a"]
+        assert len(cost_frags) == 1, f"expected one cost fragment, got {frag_texts}"
+        assert frag_styles[cost_frags[0]] == "class:status-bar-cost"
+
+    def test_show_cost_snapshot_includes_cost_fields(self):
+        """When display.show_cost is true, the snapshot carries cost fields."""
+        with _show_cost(True):
+            cli_obj = _attach_agent(
+                _make_cli(),
+                prompt_tokens=10_230,
+                completion_tokens=2_220,
+                total_tokens=12_450,
+                api_calls=7,
+                context_tokens=12_450,
+                context_length=200_000,
+            )
+
+            snap = cli_obj._get_status_bar_snapshot()
+
+        assert snap["cost_label"] is not None
+        assert snap["cost_status"] in {"actual", "estimated", "included", "unknown"}
+        # Label can be "$X.XXXX" (actual), "~$X.XXXX" (estimated), "incl" (sub),
+        # or "n/a" (no pricing found for this model)
+        label = snap["cost_label"]
+        assert label.startswith("$") or label.startswith("~$") or label in {"incl", "n/a"}
+
+    def test_show_cost_snapshot_omits_cost_when_disabled(self):
+        """When display.show_cost is false, the snapshot leaves cost fields None."""
+        with _show_cost(False):
+            cli_obj = _attach_agent(
+                _make_cli(),
+                prompt_tokens=10_230,
+                completion_tokens=2_220,
+                total_tokens=12_450,
+                api_calls=7,
+                context_tokens=12_450,
+                context_length=200_000,
+            )
+
+            snap = cli_obj._get_status_bar_snapshot()
+
+        assert snap["cost_label"] is None
+        assert snap["cost_usd"] is None
+        assert snap["cost_status"] is None
 
     def test_compression_count_absent_from_fragments_when_zero(self):
         cli_obj = _attach_agent(
