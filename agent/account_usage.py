@@ -633,6 +633,262 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+        if normalized == "minimax":
+            return _fetch_minimax_token_plan_usage(base_url, api_key)
+        if normalized in {"zai", "z-ai"}:
+            return _fetch_zai_glm_coding_plan_usage(base_url, api_key)
     except Exception:
         return None
     return None
+
+
+# chunk 3: MiniMax Token Plan + Z.AI GLM Coding Plan fetchers
+# These let the /usage surface show "5h window 23% left" / "weekly window
+# 78% left" style gauges for the subscription providers in chunk 2 instead
+# of leaving the user blind to their remaining quota. Both endpoints are
+# fail-open: if the user has no plan key, the API rejects, or the response
+# shape is unknown, ``fetch_account_usage`` returns None and the existing
+# /usage block is unchanged.
+
+
+def _fetch_minimax_token_plan_usage(
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> Optional[AccountUsageSnapshot]:
+    """Fetch MiniMax Token Plan / Coding Plan quota from the official
+    ``/v1/token_plan/remains`` endpoint.
+
+    Plan fields verified against the public response shape described in the
+    MiniMax docs and the GitHub bug thread #48 (current_interval_* and
+    current_weekly_* are the count-based quota gauges; remains_time is a
+    wall-clock countdown that the docs warn against using as a usage proxy).
+    The Token Plan key may be either the user's standard API key (pay-as-you-go
+    will not show a plan) or a ``sk-cp-*`` subscription key from the Token Plan
+    page. We accept either; if the server reports no plan fields, the snapshot
+    is None so the caller does not show a half-empty block.
+    """
+    token = str(api_key or "").strip()
+    if not token:
+        return None
+    # Host honors explicit base_url override, otherwise the global plan host.
+    # For CN users we hit the minimaxi.com mirror when MINIMAX_CN_BASE_URL is
+    # set on the user side; we derive from the supplied base_url to stay
+    # consistent with whatever the user picked for inference.
+    host = _minimax_plan_host(base_url)
+    url = f"{host}/v1/token_plan/remains"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "hermes-agent/0.1",
+    }
+    with httpx.Client(timeout=10.0) as client:
+        response = client.get(url, headers=headers)
+        if response.status_code == 401 or response.status_code == 403:
+            # Plan endpoint requires a Subscription Key; the user's standard
+            # pay-as-you-go key will not work. Fail-open so /usage still shows
+            # the cost block.
+            return None
+        response.raise_for_status()
+    payload = response.json() or {}
+
+    windows: list[AccountUsageWindow] = []
+    interval = _minimax_window_from_counts(
+        payload.get("current_interval_total_count"),
+        payload.get("current_interval_usage_count"),
+    )
+    if interval is not None:
+        windows.append(
+            AccountUsageWindow(
+                label="5-hour window",
+                used_percent=interval,
+                reset_at=_parse_dt(payload.get("remains_time")),
+            )
+        )
+    weekly = _minimax_window_from_counts(
+        payload.get("current_weekly_total_count"),
+        payload.get("current_weekly_usage_count"),
+    )
+    if weekly is not None:
+        windows.append(
+            AccountUsageWindow(
+                label="Weekly window",
+                used_percent=weekly,
+            )
+        )
+
+    details: list[str] = []
+    model_remains = payload.get("model_remains") or []
+    if isinstance(model_remains, list) and model_remains:
+        for entry in model_remains:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("model_name") or entry.get("model") or "").strip()
+            current = entry.get("current_interval_Usage_count") or entry.get("current_interval_usage_count")
+            total = entry.get("current_interval_total_count")
+            if name and isinstance(total, (int, float)) and isinstance(current, (int, float)) and float(total) > 0:
+                used = min(100.0, max(0.0, float(current) / float(total) * 100.0))
+                details.append(f"  • {name}: {used:.0f}% used this window")
+
+    if not windows and not details:
+        return None
+    return AccountUsageSnapshot(
+        provider="minimax",
+        source="token_plan_api",
+        fetched_at=_utc_now(),
+        title="MiniMax Token Plan",
+        plan="Token Plan",
+        windows=tuple(windows),
+        details=tuple(details),
+    )
+
+
+def _minimax_plan_host(base_url: Optional[str]) -> str:
+    """Pick the right host for /v1/token_plan/remains based on the user's
+    inference base_url. The global plan endpoint is minimax.io; the China
+    mirror is on the minimaxi.com domain. We strip any /anthropic or /v1
+    path the user has configured for inference so the plan URL is clean.
+    """
+    raw = str(base_url or "https://api.minimax.io/anthropic").strip()
+    parsed = None
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(raw)
+    except Exception:
+        parsed = None
+    if parsed and parsed.scheme and parsed.netloc:
+        host = f"{parsed.scheme}://{parsed.netloc}"
+    else:
+        host = "https://api.minimax.io"
+    # CN inference base is on minimaxi.com; everything else (default) is
+    # global. Be strict: only treat minimaxi.com / minimax.cn as CN.
+    if "minimaxi.com" in host or "minimax.cn" in host:
+        return "https://api.minimaxi.com"
+    return "https://api.minimax.io"
+
+
+def _minimax_window_from_counts(total: Any, used: Any) -> Optional[float]:
+    """Return percent-used for a MiniMax plan window. None when the server
+    has not provisioned a positive denominator (e.g. Token Plan Plus yearly
+    upgrade where the count fields return 0 per GitHub issue #48 — a real
+    state, not a transport failure). Returns 0.0 when total is 0 and used
+    is 0 so the gauge shows 0% rather than vanishing.
+    """
+    if not isinstance(total, (int, float)) or not isinstance(used, (int, float)):
+        return None
+    if isinstance(total, bool) or isinstance(used, bool):
+        return None
+    total_f = float(total)
+    used_f = float(used)
+    if total_f <= 0:
+        return 0.0 if used_f == 0 else None
+    if used_f < 0:
+        return None
+    return min(100.0, used_f / total_f * 100.0)
+
+
+def _fetch_zai_glm_coding_plan_usage(
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> Optional[AccountUsageSnapshot]:
+    """Fetch Z.AI / Zhipu GLM Coding Plan quota from
+    ``/api/monitor/usage/quota/limit``. Endpoint shape verified against the
+    ``@z_ai/coding-helper`` plugin's ``query-usage.mjs`` post-processor
+    (limits: list of {type, percentage, currentValue, usage, usageDetails}).
+
+    The Coding Plan is a subscription; a non-plan ``ZAI_API_KEY`` will return
+    401/403 and we return None so /usage does not show a misleading empty
+    block. CN users on bigmodel.cn hit the same path on the open.bigmodel.cn
+    host, which we infer from the supplied base_url.
+    """
+    token = str(api_key or "").strip()
+    if not token:
+        return None
+    host = _zai_plan_host(base_url)
+    url = f"{host}/api/monitor/usage/quota/limit"
+    # The @z_ai/coding-helper plugin sends the raw token (no "Bearer "
+    # prefix) and includes Accept-Language for stable CJK / English labels.
+    # Mirror that contract to stay on the documented happy path.
+    headers = {
+        "Authorization": token,
+        "Accept-Language": "en-US,en",
+        "Content-Type": "application/json",
+    }
+    with httpx.Client(timeout=10.0) as client:
+        response = client.get(url, headers=headers)
+        if response.status_code in (401, 403, 404):
+            # Non-plan key, expired key, or not a GLM Coding Plan subscriber.
+            return None
+        response.raise_for_status()
+    payload = response.json() or {}
+    limits = payload.get("limits")
+    if not isinstance(limits, list) or not limits:
+        return None
+
+    windows: list[AccountUsageWindow] = []
+    for entry in limits:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type") or "").strip().upper()
+        percentage = entry.get("percentage")
+        if not isinstance(percentage, (int, float)) or isinstance(percentage, bool):
+            continue
+        if entry_type == "TOKENS_LIMIT":
+            # 5-hour rolling window; Z.AI also reports this as the percentage
+            # of the current plan tier's token quota consumed.
+            label = "5-hour window"
+        elif entry_type == "TIME_LIMIT":
+            label = "MCP usage (monthly)"
+        else:
+            label = entry_type.title() or "Plan window"
+        windows.append(
+            AccountUsageWindow(
+                label=label,
+                used_percent=float(percentage),
+            )
+        )
+
+    details: list[str] = []
+    for entry in limits:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type") or "").strip().upper() != "TIME_LIMIT":
+            continue
+        # usageDetails is a list of MCP tool / connector call counts.
+        # Render the top 3 so the user can see what's burning their MCP quota
+        # without flooding /usage with 50 lines.
+        usage_details = entry.get("usageDetails")
+        if isinstance(usage_details, list) and usage_details:
+            top = sorted(usage_details, key=lambda x: -float(x.get("count") or 0) if isinstance(x, dict) else 0)[:3]
+            for item in top:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or item.get("tool") or "").strip()
+                count = item.get("count")
+                if name and isinstance(count, (int, float)):
+                    details.append(f"  • {name}: {int(count)} calls")
+
+    if not windows and not details:
+        return None
+    return AccountUsageSnapshot(
+        provider="zai",
+        source="glm_coding_plan_api",
+        fetched_at=_utc_now(),
+        title="GLM Coding Plan",
+        plan="GLM Coding Plan",
+        windows=tuple(windows),
+        details=tuple(details),
+    )
+
+
+def _zai_plan_host(base_url: Optional[str]) -> str:
+    """Pick the GLM Coding Plan host. Global Coding Plan keys use api.z.ai;
+    Zhipu China Coding Plan keys use open.bigmodel.cn (or dev.bigmodel.cn).
+    We mirror the @z_ai/coding-helper plugin's branching so the same env
+    var the user sets for inference routes them to the right plan host.
+    """
+    raw = str(base_url or "https://api.z.ai/api/paas/v4").strip().lower()
+    if "open.bigmodel.cn" in raw or "dev.bigmodel.cn" in raw or "bigmodel.cn" in raw:
+        return "https://open.bigmodel.cn"
+    return "https://api.z.ai"
